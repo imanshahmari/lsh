@@ -19,26 +19,72 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#include <sys/stat.h>
 #include <ctype.h>
 #include <readline/readline.h>
 #include <readline/history.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 #include "parse.h"
+
 
 #define TRUE 1
 #define FALSE 0
 
+#define STDIN_ERROR_MESSAGE "STDIN_ERROR_MESSAGE"
+#define STDOUT_ERROR_MESSAGE "STDOUT_ERROR_MESSAGE"
+#define UNKNOWN_COMMAND_ERROR_MESSAGE "UNKNOWN_COMMAND_ERROR_MESSAGE"
+
+#define CD_COMMAND "cd"
+#define EXIT_COMMAND "exit"
+
+#define HOME_KEYWORD "HOME"
+#define PATH_ENV_VAR "PATH"
+
+#define DEBUG_COMMAND_LINE_ARG "-debug"
+
+#define PATH_DIRS getenv(PATH_ENV_VAR)
+
+#define TRUE 1
+#define FALSE 0
+
+const char PATH_SEPERATOR = ':';
+
+
+
 void RunCommand(int, Command *);
+void RunCommandRecursively(Pgm *, int , int );
+void RunCommandInForground(Pgm *, int , int );
+void RunCommandInBackground(Pgm *, int , int );
+void RunSingleCommand(char **, int , int );
 void DebugPrintCommand(int, Command *);
 void PrintPgm(Pgm *);
 void stripwhite(char *);
+bool IsEqual(char *, char *);
+void RunCdCommand(char **);
+void RunExitCommand();
+bool FileExists(char* );
+bool FileExistsInDir(char *, char *);
+void GetExternalLinuxCommandFullPath(char *, char *);
+void AddPaths(char *, char *, char *);
+void SigchldHandler(int );
 
-int main(void)
+
+int main(int argc, char *argv[])
 {
+  bool debug = FALSE;
+  if (argc==2 && IsEqual(argv[1], DEBUG_COMMAND_LINE_ARG)) {debug = TRUE;}
+
+  signal(SIGCHLD, SigchldHandler);
+
   Command cmd;
   int parse_result;
 
   while (TRUE)
   {
+    // fflush(stdin);
     char *line;
     line = readline("> ");
 
@@ -52,8 +98,9 @@ int main(void)
     /* If stripped line not blank */
     if (*line)
     {
-      add_history(line);
+      // add_history(line);   ?????????????????????????
       parse_result = parse(line, &cmd);
+      if(debug) {DebugPrintCommand(parse_result, &cmd);}
       RunCommand(parse_result, &cmd);
     }
 
@@ -73,8 +120,94 @@ int main(void)
  * 2. Remove the debug printing before the final submission.
  */
 void RunCommand(int parse_result, Command *cmd)
+{  
+  int inFileDescriptor = (cmd->rstdin) ? open(cmd->rstdin, O_RDONLY | O_CREAT) : STDIN_FILENO;
+  if (inFileDescriptor<0)
+  {
+    fprintf(stderr, STDIN_ERROR_MESSAGE);
+    return;
+  }
+  int outFileDescriptor = (cmd->rstdout) ? open(cmd->rstdout, O_CREAT | O_APPEND | O_WRONLY, S_IRWXU) : STDOUT_FILENO;
+  if (outFileDescriptor<0)
+  {
+    fprintf(stderr, STDOUT_ERROR_MESSAGE);
+    return;
+  }
+  (cmd->background) ? RunCommandInBackground(cmd->pgm, inFileDescriptor, outFileDescriptor) : RunCommandInForground(cmd->pgm, inFileDescriptor, outFileDescriptor);
+
+  if (inFileDescriptor!=STDIN_FILENO) {close(inFileDescriptor);}
+  if (outFileDescriptor!=STDOUT_FILENO) {close(outFileDescriptor);}
+}
+
+
+void RunCommandInForground(Pgm* pgm, int inFileDescriptor, int outFileDescriptor) {RunCommandRecursively(pgm, inFileDescriptor, outFileDescriptor);}
+
+
+void RunCommandInBackground(Pgm* pgm, int inFileDescriptor, int outFileDescriptor)
 {
-  DebugPrintCommand(parse_result, cmd);
+  pid_t id = fork();
+  if (id==0) 
+  {
+    RunCommandRecursively(pgm, inFileDescriptor, outFileDescriptor);
+    exit(0);
+  }
+}
+
+
+void RunCommandRecursively(Pgm* pgm, int inFileDescriptor, int outFileDescriptor)
+{
+  if (pgm->next!=NULL)
+  {
+    int fd[2];
+    if (pipe(fd)==-1) {return;}
+
+    pid_t id = fork();
+    if (id==0)
+    {
+      close(fd[0]);
+      RunCommandRecursively(pgm->next, inFileDescriptor, fd[1]);
+      close(fd[1]);
+      exit(0);
+    }
+    else
+    {
+      close(fd[1]);
+      waitpid(id, NULL, 0);
+      RunSingleCommand(pgm->pgmlist, fd[0], outFileDescriptor);
+      close(fd[0]);
+    }
+  }
+  else
+  { 
+    RunSingleCommand(pgm->pgmlist, inFileDescriptor, outFileDescriptor);
+  }
+}
+
+
+void RunSingleCommand(char **pgmlist, int inFileDescriptor, int outFileDescriptor)
+{
+  char* cmd = *pgmlist;
+  char** args = pgmlist+1;
+  if(IsEqual(cmd, CD_COMMAND)) {RunCdCommand(args);}
+  else if(IsEqual(cmd, EXIT_COMMAND)) {RunExitCommand();}
+  else
+  {
+    char externalLinuxCommandFullPath[strlen(PATH_DIRS)+strlen(cmd)+2];
+    GetExternalLinuxCommandFullPath(cmd, externalLinuxCommandFullPath);
+    if (*externalLinuxCommandFullPath)
+    {
+      pid_t id = fork();
+      if (id==0)
+      {  
+        if (outFileDescriptor!=STDOUT_FILENO) {dup2(outFileDescriptor, STDOUT_FILENO);} 
+        if (inFileDescriptor!=STDIN_FILENO) {dup2(inFileDescriptor, STDIN_FILENO);}
+        if(execvp(externalLinuxCommandFullPath, pgmlist) == -1) {return;}
+      }
+      else {waitpid(id, NULL, 0);}
+    }
+    else {printf("%s\n", UNKNOWN_COMMAND_ERROR_MESSAGE);}
+  }
+  return;
 }
 
 
@@ -154,3 +287,106 @@ void stripwhite(char *string)
 
   string[++i] = '\0';
 }
+
+
+bool IsEqual(char* string1, char* string2)
+{
+
+  return (strcmp(string1, string2)==0); 
+}
+
+
+void RunCdCommand(char** args)
+{
+  char* newDir = (*args==NULL) ? getenv(HOME_KEYWORD) : *args; 
+  if(chdir(newDir)==-1) { printf("failed to change dir to %s\n", newDir);}  
+  return;
+}
+
+
+void RunExitCommand()
+{
+  exit(0);
+  return;
+}
+
+    
+bool FileExists(char* filename)
+{
+  struct stat buffer;   
+  return (stat(filename, &buffer)==0);
+}
+
+
+bool FileExistsInDir(char* filename, char* dir)
+{
+  char* fullPath = strdup(dir);
+  strcat(fullPath, "/");
+  strcat(fullPath, filename);
+  bool cmdExists = FileExists(fullPath);
+  free(fullPath);
+
+  if (cmdExists) {return TRUE;}
+  return FALSE;
+}
+
+
+void GetExternalLinuxCommandFullPath(char* cmd, char* externalLinuxCommandFullPath)
+{
+  char* dirStartIdx = PATH_DIRS;
+
+  bool done = FALSE;
+  while (!done)
+  {
+    char* nextDirStartIdx = strchr(dirStartIdx, PATH_SEPERATOR);
+    if (nextDirStartIdx==NULL)
+    {
+      nextDirStartIdx = PATH_DIRS + strlen(PATH_DIRS);
+      done = TRUE;
+    }
+    
+    char dir[nextDirStartIdx-dirStartIdx+1];
+    strncpy(dir,dirStartIdx,nextDirStartIdx-dirStartIdx+1);
+    dir[nextDirStartIdx-dirStartIdx] = '\0';
+    if (FileExistsInDir(cmd, dir))
+    {
+      AddPaths(dir, cmd, externalLinuxCommandFullPath);
+      return;
+    }
+
+    dirStartIdx = nextDirStartIdx+1;
+  }
+
+  *externalLinuxCommandFullPath = 0;
+  return;
+}
+
+
+void AddPaths(char* dir, char* filename, char* result)
+{
+    strcpy(result, dir);
+    strcat(result, "/");
+    strcat(result, filename);
+    return;
+}
+
+
+void SigchldHandler(int signum) {waitpid(-1, NULL, WNOHANG);}
+
+
+
+// int main()
+// {
+//   int id = fork();
+
+//   if (id==0)
+//   {
+//     setpgid(0,0);
+//   }
+//   else
+//   {
+
+//   }
+
+//   return 0;
+// }
