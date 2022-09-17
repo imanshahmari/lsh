@@ -33,9 +33,10 @@
 #define TRUE 1
 #define FALSE 0
 
-#define STDIN_ERROR_MESSAGE "STDIN_ERROR_MESSAGE"
-#define STDOUT_ERROR_MESSAGE "STDOUT_ERROR_MESSAGE"
-#define UNKNOWN_COMMAND_ERROR_MESSAGE "UNKNOWN_COMMAND_ERROR_MESSAGE"
+#define STDIN_ERROR_MESSAGE "%s: Cannot open file\n"
+#define STDOUT_ERROR_MESSAGE "%s: Cannot open file\n"
+#define UNKNOWN_COMMAND_ERROR_MESSAGE "%s: Command not found\n"
+#define CD_ERROR_MESSAGE "%s: No such file or directory\n"
 
 #define CD_COMMAND "cd"
 #define EXIT_COMMAND "exit"
@@ -52,11 +53,12 @@
 
 const char PATH_SEPERATOR = ':';
 
+pid_t MAIN_PROCESS_PID;
 
 
 void RunCommand(int, Command *);
 void RunCommandRecursively(Pgm *, int , int );
-void RunCommandInForground(Pgm *, int , int );
+void RunCommandInForeground(Pgm *, int , int );
 void RunCommandInBackground(Pgm *, int , int );
 void RunSingleCommand(char **, int , int );
 void DebugPrintCommand(int, Command *);
@@ -65,26 +67,33 @@ void stripwhite(char *);
 bool IsEqual(char *, char *);
 void RunCdCommand(char **);
 void RunExitCommand();
-bool FileExists(char* );
+bool FileExists(char *);
 bool FileExistsInDir(char *, char *);
 void GetExternalLinuxCommandFullPath(char *, char *);
 void AddPaths(char *, char *, char *);
 void SigchldHandler(int );
+void SigintHandlerWhileRunningForgraoundProcess(int );
+void SigintHandlerWhileNotRunningForgraoundProcess(int );
+
 
 
 int main(int argc, char *argv[])
 {
+
+  setpgid(0,0);
+  MAIN_PROCESS_PID = getpid();
+
   bool debug = FALSE;
   if (argc==2 && IsEqual(argv[1], DEBUG_COMMAND_LINE_ARG)) {debug = TRUE;}
 
   signal(SIGCHLD, SigchldHandler);
+  signal(SIGINT, SigintHandlerWhileNotRunningForgraoundProcess);
 
   Command cmd;
   int parse_result;
 
   while (TRUE)
   {
-    // fflush(stdin);
     char *line;
     line = readline("> ");
 
@@ -98,10 +107,12 @@ int main(int argc, char *argv[])
     /* If stripped line not blank */
     if (*line)
     {
-      // add_history(line);   ?????????????????????????
+      add_history(line);
       parse_result = parse(line, &cmd);
       if(debug) {DebugPrintCommand(parse_result, &cmd);}
+      signal(SIGINT, SigintHandlerWhileRunningForgraoundProcess);
       RunCommand(parse_result, &cmd);
+      signal(SIGINT, SigintHandlerWhileNotRunningForgraoundProcess);
     }
 
     /* Clear memory */
@@ -121,26 +132,35 @@ int main(int argc, char *argv[])
  */
 void RunCommand(int parse_result, Command *cmd)
 {  
-  int inFileDescriptor = (cmd->rstdin) ? open(cmd->rstdin, O_RDONLY | O_CREAT) : STDIN_FILENO;
+  int inFileDescriptor = (cmd->rstdin) ? open(cmd->rstdin, O_RDONLY) : STDIN_FILENO;
   if (inFileDescriptor<0)
   {
-    fprintf(stderr, STDIN_ERROR_MESSAGE);
+    fprintf(stderr, STDIN_ERROR_MESSAGE, cmd->rstdin);
     return;
   }
   int outFileDescriptor = (cmd->rstdout) ? open(cmd->rstdout, O_CREAT | O_APPEND | O_WRONLY, S_IRWXU) : STDOUT_FILENO;
   if (outFileDescriptor<0)
   {
-    fprintf(stderr, STDOUT_ERROR_MESSAGE);
+    fprintf(stderr, STDOUT_ERROR_MESSAGE, cmd->rstdout);
     return;
   }
-  (cmd->background) ? RunCommandInBackground(cmd->pgm, inFileDescriptor, outFileDescriptor) : RunCommandInForground(cmd->pgm, inFileDescriptor, outFileDescriptor);
+  (cmd->background) ? RunCommandInBackground(cmd->pgm, inFileDescriptor, outFileDescriptor) : RunCommandInForeground(cmd->pgm, inFileDescriptor, outFileDescriptor);
 
   if (inFileDescriptor!=STDIN_FILENO) {close(inFileDescriptor);}
   if (outFileDescriptor!=STDOUT_FILENO) {close(outFileDescriptor);}
 }
 
 
-void RunCommandInForground(Pgm* pgm, int inFileDescriptor, int outFileDescriptor) {RunCommandRecursively(pgm, inFileDescriptor, outFileDescriptor);}
+void RunCommandInForeground(Pgm* pgm, int inFileDescriptor, int outFileDescriptor)
+{
+  pid_t id = fork();
+  if (id==0) 
+  {
+    RunCommandRecursively(pgm, inFileDescriptor, outFileDescriptor);
+    exit(0);
+  }
+  else(waitpid(id, NULL, 0));
+}
 
 
 void RunCommandInBackground(Pgm* pgm, int inFileDescriptor, int outFileDescriptor)
@@ -148,6 +168,7 @@ void RunCommandInBackground(Pgm* pgm, int inFileDescriptor, int outFileDescripto
   pid_t id = fork();
   if (id==0) 
   {
+    setpgid(0,0);
     RunCommandRecursively(pgm, inFileDescriptor, outFileDescriptor);
     exit(0);
   }
@@ -195,19 +216,13 @@ void RunSingleCommand(char **pgmlist, int inFileDescriptor, int outFileDescripto
     char externalLinuxCommandFullPath[strlen(PATH_DIRS)+strlen(cmd)+2];
     GetExternalLinuxCommandFullPath(cmd, externalLinuxCommandFullPath);
     if (*externalLinuxCommandFullPath)
-    {
-      pid_t id = fork();
-      if (id==0)
-      {  
-        if (outFileDescriptor!=STDOUT_FILENO) {dup2(outFileDescriptor, STDOUT_FILENO);} 
-        if (inFileDescriptor!=STDIN_FILENO) {dup2(inFileDescriptor, STDIN_FILENO);}
-        if(execvp(externalLinuxCommandFullPath, pgmlist) == -1) {return;}
-      }
-      else {waitpid(id, NULL, 0);}
+    { 
+      if (outFileDescriptor!=STDOUT_FILENO) {dup2(outFileDescriptor, STDOUT_FILENO);} 
+      if (inFileDescriptor!=STDIN_FILENO) {dup2(inFileDescriptor, STDIN_FILENO);}
+      if(execvp(externalLinuxCommandFullPath, pgmlist) == -1) {return;}
     }
-    else {printf("%s\n", UNKNOWN_COMMAND_ERROR_MESSAGE);}
+    else {fprintf(stderr, UNKNOWN_COMMAND_ERROR_MESSAGE, cmd);}
   }
-  return;
 }
 
 
@@ -299,16 +314,11 @@ bool IsEqual(char* string1, char* string2)
 void RunCdCommand(char** args)
 {
   char* newDir = (*args==NULL) ? getenv(HOME_KEYWORD) : *args; 
-  if(chdir(newDir)==-1) { printf("failed to change dir to %s\n", newDir);}  
-  return;
+  if(chdir(newDir)==-1) { fprintf(stderr, CD_ERROR_MESSAGE, newDir);}  
 }
 
 
-void RunExitCommand()
-{
-  exit(0);
-  return;
-}
+void RunExitCommand() {exit(0);}
 
     
 bool FileExists(char* filename)
@@ -358,7 +368,6 @@ void GetExternalLinuxCommandFullPath(char* cmd, char* externalLinuxCommandFullPa
   }
 
   *externalLinuxCommandFullPath = 0;
-  return;
 }
 
 
@@ -367,26 +376,21 @@ void AddPaths(char* dir, char* filename, char* result)
     strcpy(result, dir);
     strcat(result, "/");
     strcat(result, filename);
-    return;
 }
 
 
 void SigchldHandler(int signum) {waitpid(-1, NULL, WNOHANG);}
 
 
+void SigintHandlerWhileRunningForgraoundProcess(int signum)
+{
+  if (getpgid(0)==MAIN_PROCESS_PID && getpid()!=MAIN_PROCESS_PID) {exit(0);}
+  if (getpid()==MAIN_PROCESS_PID) {printf("\n");}
+}
 
-// int main()
-// {
-//   int id = fork();
+void SigintHandlerWhileNotRunningForgraoundProcess(int signum)
+{
+  SigintHandlerWhileRunningForgraoundProcess(signum);
+  printf("> ");
+}
 
-//   if (id==0)
-//   {
-//     setpgid(0,0);
-//   }
-//   else
-//   {
-
-//   }
-
-//   return 0;
-// }
